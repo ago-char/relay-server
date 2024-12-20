@@ -14,7 +14,7 @@ def connect_to(addr: tuple) -> socket.socket:
         client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         client.connect(addr)
         client.setblocking(False)
-        print(f"Connected to server at {client.getp}")
+        print(f"Connected to server at {client.getpeername()}")
         return client
     except Exception as e:
         print(f"Exception: {e.__class__.__name__}, {str(e)}")
@@ -159,10 +159,11 @@ def main() -> None:
                     send_to(in_sock, data)
                 buffer_list.clear()
             
-            if not conn:
-                client_sock = connect_to((rhost, rport))
-                sock_list.append(client_sock)
-                conn = True
+        if not conn:
+            print("surror")
+            client_sock = connect_to((rhost, rport))
+            sock_list.append(client_sock)
+            conn = True
             continue
 
 
@@ -188,12 +189,13 @@ def main() -> None:
                             else:
                                 buffer_list.append(data)
                 else:
+                    sock_list.clear()
+                    sock_list.append(server_sock)
                     buffer_list.clear()
                     conn = False
                     if not writable_sock is client_sock and not writable_sock is server_sock:
                         readable_sock.shutdown(socket.SHUT_RDWR)
                     readable_sock.close()
-                    sock_list.remove(readable_sock)
                     print("Connection closed...\n")
 
 
