@@ -7,6 +7,7 @@
 - multi connections accepeted
 
 ## Usuage
+```bash
 usage: relay.py [-h] -lh LISTEN_HOST -lp LISTEN_PORT -rh REMOTE_HOST -rp
                 REMOTE_PORT [--ssl]
 
@@ -21,6 +22,7 @@ options:
   -rp REMOTE_PORT, --remote-port REMOTE_PORT
                         Port of remote host
   --ssl                 Use SSL for connection
+```
 
 
 ## Requirements/Installation
