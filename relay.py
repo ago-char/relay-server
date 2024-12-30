@@ -5,6 +5,18 @@ import sys
 import select
 import threading
 import ssl
+import argparse
+
+
+def argument_parser() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-lh', '--listen-host', help="IP or hostname of listening host", type=str, required=True)
+    parser.add_argument('-lp', '--listen-port', help="Port of listening host", type=int, required=True)
+    parser.add_argument('-rh', '--remote-host', help="IP or hostname of remote host", type=str, required=True)
+    parser.add_argument('-rp', '--remote-port', help="Port of remote host", type=int, required=True)
+    parser.add_argument('--ssl', help="Use SSL for connection", action='store_false')
+    args = parser.parse_args()
+    return args
 
 def usuage(scriptName: str):
     msg =f"""
@@ -26,7 +38,7 @@ def connect_to(addr: tuple) -> socket.socket:
     try:
         client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         client.connect(addr)
-        # client.setblocking(False)
+        client.setblocking(False)
         print(f"Connected to server at {client.getpeername()}")
         return client
     except Exception as e:
@@ -254,12 +266,11 @@ def enable_ssl_both_ways(in_sock: socket.socket, out_sock: socket.socket) -> lis
 
 
 
-def proxy_thread(in_sock: socket.socket, rhost: str, rport: str, use_ssl: bool):
+def proxy_thread(in_sock: socket.socket, rhost: str, rport: int, use_ssl: bool):
     """
     This method is run seperately in a thread as a relay between in_sock (remote_client) and out_sock (remote_server).
     in_sock is what is provided and out_sock is the socket after connect((rhost, rport))
     """
-    print("on thread")
     out_sock = connect_to((rhost, rport))
     if out_sock:
         sock_list = [in_sock, out_sock]
@@ -269,6 +280,7 @@ def proxy_thread(in_sock: socket.socket, rhost: str, rport: str, use_ssl: bool):
             ready_to_read, ready_to_write, _ = select.select(sock_list, sock_list, [], 100)
 
             if use_ssl and in_sock in ready_to_read and does_client_req_ssl(in_sock):
+                print("surror")
                 try:
                     sock_list = enable_ssl_both_ways(in_sock, out_sock)
                     in_sock, out_sock = sock_list
@@ -309,22 +321,14 @@ def proxy_thread(in_sock: socket.socket, rhost: str, rport: str, use_ssl: bool):
 # driver code 
 def main() -> None:
 
-    # if enough arg to work on is not provided, print usuage and exit the program 
-    if len(sys.argv) !=6:
-        print("Current Error: Not enough args provided to work on.")
-        usuage(sys.argv[0])
-        sys.exit(0)
-    
-    lhost = str(sys.argv[1])
-    lport = int(sys.argv[2])
 
-    rhost = str(sys.argv[3])
-    rport = int(sys.argv[4])
+    args = argument_parser()
 
-    if str(sys.argv[5] == "use_ssl"):
-        use_ssl = True
-    else:
-        use_ssl = False
+    lhost = args.listen_host
+    lport = args.listen_port
+    rhost = args.remote_host
+    rport = args.remote_port
+    use_ssl = args.ssl
 
     # start listening on lhost, lport which is actually proxy listener 
     server_sock = start_listening(lhost, lport)
@@ -334,7 +338,7 @@ def main() -> None:
         try:
             while True:
                 # accept connection and forward it to the proxy_thread 
-                in_sock, _ = accept_connection(server_sock)
+                in_sock, _ = accept_connection(server_sock, False)
                 p_thread = threading.Thread(target=proxy_thread, args=(in_sock, rhost, rport, use_ssl))
                 p_thread.start() # i.e p_thread means proxy_thread (named as p_thread to avoid confusion with function name i.e also named as proxy_thread)
         except KeyboardInterrupt:
