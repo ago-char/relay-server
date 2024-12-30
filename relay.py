@@ -9,6 +9,9 @@ import argparse
 
 
 def argument_parser() -> argparse.Namespace:
+    """
+    add the necessary arguments to the parser and return the parsed arguments
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument('-lh', '--listen-host', help="IP or hostname of listening host", type=str, required=True)
     parser.add_argument('-lp', '--listen-port', help="Port of listening host", type=int, required=True)
