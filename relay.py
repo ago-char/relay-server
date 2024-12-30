@@ -3,13 +3,15 @@
 import socket
 import sys
 import select
+import threading
+import ssl
 
 def usuage(scriptName: str):
     msg =f"""
     This script is designed to be relay server (middle proxy) that will listen on spefic port and
     forwad connection back and forth from remote client and remote server using sockets.
 
-    Usuage: {scriptName} <listen_host> <listen_port> <remote_server> <remote_port>
+    Usuage: {scriptName} <listen_host> <listen_port> <remote_server> <remote_port> [use_ssl]
 
     This script requires 'sudo' or 'admin' privileges if provided privileged ports to work on. 
     """
@@ -24,7 +26,7 @@ def connect_to(addr: tuple) -> socket.socket:
     try:
         client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         client.connect(addr)
-        client.setblocking(False)
+        # client.setblocking(False)
         print(f"Connected to server at {client.getpeername()}")
         return client
     except Exception as e:
@@ -59,9 +61,10 @@ def get_bindAddress(sock: socket.socket) -> tuple:
         return None
 
 
-def start_listening(lhost = 'localhost', lport = 9999) -> socket.socket:
+def start_listening(lhost = 'localhost', lport = 9999, blocking_sock = True) -> socket.socket:
     """
-    start listening on specified lhost:lport, defaulting to localhost:9999, if value not given 
+    start listening on specified lhost:lport, defaulting to localhost:9999, if value not given
+    blocking_sock = True makes the socks blocking and False make it non-blocking, if you are planning to use it with select or selectors make it non-blocking passing blocking_sock = False
     return the listening socket, None if expection encountered
     """
     # init socket 
@@ -72,10 +75,12 @@ def start_listening(lhost = 'localhost', lport = 9999) -> socket.socket:
     try:
         server_sock.bind((lhost, lport))
         server_sock.listen(5)
-        server_sock.setblocking(False)
+        if not blocking_sock:
+            server_sock.setblocking(False)
         return server_sock
     except Exception as e:
         print(f"Exception: {e.__class__.__name__}, {str(e)}")
+        print("surror")
         sys.exit(f"Exited 1. Unable to listen on {lhost}:{lport}...")
         return None
 
@@ -93,15 +98,17 @@ def is_listening(sock: socket.socket) -> bool:
         return False  # In case of any error or expection, assume it's not listening
 
 
-def accept_connection(server_sock: socket.socket) -> tuple:
+def accept_connection(server_sock: socket.socket, blocking_sock = True) -> tuple:
     """
     Accept the connection on the socket which is binded and listening on some addr
+    Specify blocking_sock as True if you want to make the incomming sock from server sock blocking (this is default). Specify False if you wanna make same incomming sock non-blocking (useful when you will want to use this in_sock with select or selectors)
     """
     if is_listening(server_sock):
         print(f"Listening on {get_bindAddress(server_sock)} ...")
         in_sock, in_addr = server_sock.accept()
-        in_sock.setblocking(False)
-        print(f"Connected to {in_sock.getpeername()}...")
+        if not blocking_sock:
+            in_sock.setblocking(False)
+        print(f"Connected from {in_sock.getpeername()}...")
         return (in_sock, in_addr)
 
 
@@ -171,10 +178,139 @@ def wrap_up_when_remote_closed_conn(sock_list: list, proxy_server: socket.socket
     print("Connection closed...\n") # a simple message
 
 
+def find_peer(sock: socket.socket)-> tuple:
+    """
+    return peer i.e ip, port of the other end of connected socket
+    return None if not connected or Expection encountered
+    """
+    try:
+        peer = sock.getpeername()
+        return peer
+    except Exception as e:
+        print(f"Exception: {e.__class__.__name__}, {str(e)}")
+        print("Error on finding peer...")
+        return None
+
+
+def close_socks(socks: list):
+    sock: socket.socket
+    for sock in socks:
+        sock.close()
+
+
+def is_client_hello(sock: socket.socket):
+    """
+    check if client hello has been received on the sock
+    it reads frist few byte sequence to identify if ssl handshake has been done, if yes it will check for version compatible
+    if handshake has been performed and version is compatible return True else False
+    """
+    firstbytes = sock.recv(128, socket.MSG_PEEK)
+    return (len(firstbytes) >= 3 and
+            firstbytes[0] == 0x16 and           # first byte of byte sequence of client hello is \x16
+            firstbytes[1:3] in [b"\x03\x00",    # second and third byte sequence for ssl 3.0
+                                b"\x03\x01",    # second and third byte sequence for tls 1.0
+                                b"\x03\x02",    # second and third byte sequence for tls 1.1
+                                b"\x03\x03",    # second and third byte sequence for tls 1.2
+                                b"\x02\x00"]    # second and third byte sequence for ssl v2
+            )
+
+
+def does_client_req_ssl(in_sock: socket.socket) -> bool:
+    """
+    check if in_cock is already ssl enabled, if not check that if the server has received client hello (with the request of ssl)
+    if client hello (with ssl) has been received than return True else False
+    """
+    return (not isinstance(in_sock, ssl.SSLSocket) and is_client_hello(in_sock))
+
+
+def enable_ssl_both_ways(in_sock: socket.socket, out_sock: socket.socket) -> list:
+    """
+    as this is proxy server ssl must be enable on incomming and outgoing socket
+    """
+
+    try:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile="server-cert.pem", keyfile="server-key.pem")
+        in_sock = context.wrap_socket(in_sock, server_side=True)
+        print(in_sock.getpeercert())
+    except Exception as e:
+        print(f"Exception: {e.__class__.__name__}, {str(e)}")
+        print("SSL Handshake failed for listening sock..")
+        raise
+
+
+    try:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        context.load_cert_chain(certfile="server-cert.pem", keyfile="server-key.pem")
+        out_sock = context.wrap_socket(out_sock)
+    except Exception as e:
+        print(f"Exception: {e.__class__.__name__}, {str(e)}")
+        print("SSL Handshake failed for remote server..")
+        raise
+
+    return [in_sock, out_sock]
+
+
+
+def proxy_thread(in_sock: socket.socket, rhost: str, rport: str, use_ssl: bool):
+    """
+    This method is run seperately in a thread as a relay between in_sock (remote_client) and out_sock (remote_server).
+    in_sock is what is provided and out_sock is the socket after connect((rhost, rport))
+    """
+    print("on thread")
+    out_sock = connect_to((rhost, rport))
+    if out_sock:
+        sock_list = [in_sock, out_sock]
+        isConnected = True
+        # isConnected will show the state where we are connected to both ends, if one connection is closed this will be False and our loop will end 
+        while isConnected:
+            ready_to_read, ready_to_write, _ = select.select(sock_list, sock_list, [], 100)
+
+            if use_ssl and in_sock in ready_to_read and does_client_req_ssl(in_sock):
+                try:
+                    sock_list = enable_ssl_both_ways(in_sock, out_sock)
+                    in_sock, out_sock = sock_list
+                    print("SSL enable on both remote client and remote server.")
+                except:
+                    isConnected = False
+                    break
+
+            ready_to_read, ready_to_write, _ = select.select(sock_list, sock_list, [], 100)
+
+
+            for readable_sock in ready_to_read:
+                peer = find_peer(readable_sock)
+                if not peer: # if peer is not find, that is connection is already dead
+                    isConnected = False
+                    close_socks(sock_list)
+                    break
+                else: # connection is alive
+                    data = receive_from(readable_sock)
+                    if not data: # if no data received, that is connection is closed
+                        isConnected = False
+                        close_socks(sock_list)
+                        break
+                    else: # connection is alive
+                        hexdump(data)
+                        # if data is received from remote client forward it to remote server (if it is ready_to_write)
+                        if readable_sock == in_sock and out_sock in ready_to_write:
+                            sent = send_to(out_sock, data)
+                        # if data is received from remote server forward it to remote client (if it is ready_to_read)
+                        elif readable_sock == out_sock and in_sock in ready_to_write:
+                            sent = send_to(in_sock, data)
+                        if not sent: # connection is not active i.e closed
+                            isConnected = False
+                            close_socks(sock_list)
+                            break
+
+
+# driver code 
 def main() -> None:
 
     # if enough arg to work on is not provided, print usuage and exit the program 
-    if len(sys.argv) !=4:
+    if len(sys.argv) !=6:
         print("Current Error: Not enough args provided to work on.")
         usuage(sys.argv[0])
         sys.exit(0)
@@ -185,57 +321,25 @@ def main() -> None:
     rhost = str(sys.argv[3])
     rport = int(sys.argv[4])
 
-    conn = False
+    if str(sys.argv[5] == "use_ssl"):
+        use_ssl = True
+    else:
+        use_ssl = False
 
-    # start listening on the socket (proxy listener)
+    # start listening on lhost, lport which is actually proxy listener 
     server_sock = start_listening(lhost, lport)
-    sock_list = [server_sock] # a list for use of select to find readable, writable sock, etc
-    buffer_list = [] # a buffer in case data is yet to send but connection has been made
 
-    while True:
-
-        # check the sock state 
+    # endless loop to accept multiple connection until ctrl+c
+    if server_sock: 
         try:
-            ready_to_read, ready_to_write, in_error = select.select(sock_list, sock_list, [], 5)
-        except Exception as e:
-            print(f"Exception: {e.__class__.__name__}, {str(e)}")
-            print("Some Error on socket...select")
-            break
-
-        # as it is single client server, check if the connection is already made, if not made accept the connection on the listener and connect to remote server 
-        if not conn:
-            if server_sock in ready_to_read:
+            while True:
+                # accept connection and forward it to the proxy_thread 
                 in_sock, _ = accept_connection(server_sock)
-                sock_list.append(in_sock)
-
-                client_sock = connect_to((rhost, rport))
-                sock_list.append(client_sock)
-                conn = True
-            continue
-
-
-        # read data from readble socket (which is remote clinet or server) and write to writable socket (which is also remote client or server), if data is received from remote client, will be sent to remote server and vice-versa
-        readable_sock: socket.socket
-        writable_sock: socket.socket
-        for readable_sock in ready_to_read:
-            if not readable_sock is server_sock:
-                print(readable_sock.fileno())
-                peer = readable_sock.getpeername()
-                data = receive_from(readable_sock)
-                if data: # send whatever is received
-                    print(f"{len(data)} bytes received from {peer}.")
-                    hexdump(data)
-                    # make sure not to send on the same socket, from where data is recieved and hence is checked as: if sock is not readable_sock 
-                    writable_sock = [sock for sock in ready_to_write if not sock is server_sock and not sock is readable_sock]
-                    sent = send_to(writable_sock[0], data)
-                    if not sent: # connection closed
-                        conn = False
-                        wrap_up_when_remote_closed_conn(sock_list, server_sock, client_sock, buffer_list)
-                        break
-                else: # if data not received i.e connection closed
-                    conn = False
-                    wrap_up_when_remote_closed_conn(sock_list, server_sock, client_sock, buffer_list)
-
+                p_thread = threading.Thread(target=proxy_thread, args=(in_sock, rhost, rport, use_ssl))
+                p_thread.start() # i.e p_thread means proxy_thread (named as p_thread to avoid confusion with function name i.e also named as proxy_thread)
+        except KeyboardInterrupt:
+            print("\nCtrl+C detected, Aborting...")       
+            sys.exit(0)
 
 
 if __name__ == "__main__":
